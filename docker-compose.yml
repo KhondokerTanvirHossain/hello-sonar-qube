@@ -12,6 +12,7 @@ services:
       SONAR_JDBC_PASSWORD: sonar
     depends_on:
       - db
+    restart: always
 
   db:
     image: postgres:13
@@ -22,6 +23,7 @@ services:
       POSTGRES_DB: sonarqube
     volumes:
       - sonarqube_db_data:/var/lib/postgresql/data
+    restart: always
 
 volumes:
   sonarqube_db_data:

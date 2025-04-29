@@ -64,9 +64,7 @@ sonarqube_db_data: Stores PostgreSQL data persistently.
 
 ## Troubleshooting
 
-### Common Issues
-
-1. Elasticsearch Errors:
+### Elasticsearch Errors
 
 Ensure sufficient disk space is available.
 Allocate enough memory to Elasticsearch by setting SONAR_ES_JAVAOPTS in the docker-compose.yml file:
@@ -84,6 +82,42 @@ To view logs for debugging:
 ```bash
 docker logs -f sonarqube
 docker logs -f sonarqube_db
+```
+### Elasticsearch Failed to Start Due to `vm.max_map_count`
+
+If Elasticsearch fails to start with an error indicating that `vm.max_map_count` is too low, you need to increase this value to at least `262144`. Follow these steps to resolve the issue:
+
+#### Temporary Fix
+
+To temporarily increase the value (until the next reboot), run:
+
+```bash
+sudo sysctl -w vm.max_map_count=262144
+```
+
+To make the change permanent, append the following line to /etc/sysctl.conf:
+
+```bash
+echo "vm.max_map_count=262144" | sudo tee -a
+```
+
+Then reload the configuration:
+
+```bash
+sudo sysctl -p
+```
+
+Check if the value has been updated successfully:
+
+```bash
+sysctl vm.max_map_count
+```
+
+After applying this fix, restart the services:
+
+```bash
+docker-compose down
+docker-compose up -d
 ```
 
 ## Stopping the Services

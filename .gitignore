@@ -1,0 +1,39 @@
+# Docker
+*.log
+docker-compose.override.yml
+docker-compose.*.yml
+docker-compose.*.env
+.docker/
+**/.docker/
+
+# AWS
+.aws/
+*.pem
+*.key
+*.crt
+aws-setup-terraform/.terraform/
+aws-setup-terraform/terraform.tfstate*
+aws-setup-terraform/terraform.tfvars
+aws-setup-terraform/.terraform.lock.hcl
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Misc
+*.swp
+*.swo
+*.bak

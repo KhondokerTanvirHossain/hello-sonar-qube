@@ -62,11 +62,16 @@ aws-sonarqube/
 
 ### 3.1 Main Configuration (main.tf)
 ```hcl
+# Add random provider
 terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
     }
   }
 }
@@ -86,7 +91,7 @@ data "aws_availability_zones" "available" {
 variable "aws_region" {
   description = "AWS region"
   type        = string
-  default     = "us-east-1"
+  default     = "ap-south-1"
 }
 
 variable "project_name" {
@@ -102,8 +107,9 @@ variable "environment" {
 }
 
 variable "db_password" {
-  description = "Database password"
+  description = "Database password (auto-generated if not provided)"
   type        = string
+  default     = ""
   sensitive   = true
 }
 ```
@@ -133,6 +139,13 @@ resource "aws_subnet" "public" {
   tags = {
     Name = "${var.project_name}-public-${count.index + 1}"
   }
+}
+
+# Associate public subnets with public route table
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
 }
 
 # Private Subnets
@@ -171,12 +184,129 @@ resource "aws_route_table" "public" {
   }
 }
 
-# Route Table Association
-resource "aws_route_table_association" "public" {
-  count = length(aws_subnet.public)
+# Private Route Table (for private subnets)
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
 
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+  tags = {
+    Name = "${var.project_name}-private-rt"
+  }
+}
+
+# ECR Repository for SonarQube
+resource "aws_ecr_repository" "sonarqube" {
+  name                 = "${var.project_name}-sonarqube"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = {
+    Name = "${var.project_name}-sonarqube-ecr"
+  }
+}
+
+# ECR Repository Policy (allows ECS to pull)
+resource "aws_ecr_repository_policy" "sonarqube" {
+  repository = aws_ecr_repository.sonarqube.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowECSPull"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+      }
+    ]
+  })
+}
+
+# VPC Endpoints for ECR (so private subnets can access ECR without internet)
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.ecr.dkr"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-ecr-dkr-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "ecr_api" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-ecr-api-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+
+  tags = {
+    Name = "${var.project_name}-s3-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.logs"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-logs-endpoint"
+  }
+}
+
+# Security Group for VPC Endpoints
+resource "aws_security_group" "vpc_endpoints" {
+  name        = "${var.project_name}-vpc-endpoints-sg"
+  description = "Security group for VPC endpoints"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_tasks.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-vpc-endpoints-sg"
+  }
 }
 ```
 
@@ -217,12 +347,38 @@ resource "aws_security_group" "rds" {
   }
 }
 
+# Random password for RDS
+resource "random_password" "db_password" {
+  length  = 16
+  special = true
+  # Exclude problematic characters for RDS
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+# AWS Secrets Manager secret for database password
+resource "aws_secretsmanager_secret" "db_password" {
+  name        = "${var.project_name}-db-password"
+  description = "Database password for SonarQube RDS instance"
+
+  tags = {
+    Name = "${var.project_name}-db-password"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = jsonencode({
+    username = "sonarqube"
+    password = random_password.db_password.result
+  })
+}
+
 # RDS Instance
 resource "aws_db_instance" "sonarqube" {
   identifier = "${var.project_name}-db"
 
   engine         = "postgres"
-  engine_version = "14.9"
+  engine_version = "15.7"
   instance_class = "db.t3.micro"
 
   allocated_storage     = 20
@@ -230,7 +386,7 @@ resource "aws_db_instance" "sonarqube" {
 
   db_name  = "sonarqube"
   username = "sonarqube"
-  password = var.db_password
+  password = random_password.db_password.result
 
   vpc_security_group_ids = [aws_security_group.rds.id]
   db_subnet_group_name   = aws_db_subnet_group.main.name
@@ -295,7 +451,7 @@ resource "aws_ecs_task_definition" "sonarqube" {
   container_definitions = jsonencode([
     {
       name  = "sonarqube"
-      image = "sonarqube:community"
+    image = "sonarqube:lts-community"
 
       portMappings = [
         {
@@ -315,7 +471,7 @@ resource "aws_ecs_task_definition" "sonarqube" {
         },
         {
           name  = "SONAR_JDBC_PASSWORD"
-          value = var.db_password
+          value = random_password.db_password.result
         },
         {
           name  = "SONAR_ES_BOOTSTRAP_CHECKS_DISABLE"
@@ -355,9 +511,9 @@ resource "aws_ecs_service" "sonarqube" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = aws_subnet.private[*].id
+    subnets          = aws_subnet.public[*].id  # TEMPORARY: Use public subnets
     security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = false
+    assign_public_ip = true  # TEMPORARY: Assign public IP
   }
 
   load_balancer {
@@ -393,9 +549,40 @@ resource "aws_iam_role" "ecs_task_execution" {
   })
 }
 
+# Attach the default ECS task execution policy
 resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
   role       = aws_iam_role.ecs_task_execution.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# Additional ECR permissions for task execution role
+resource "aws_iam_role_policy" "ecs_task_execution_ecr" {
+  name = "${var.project_name}-ecs-task-execution-ecr-policy"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 resource "aws_iam_role" "ecs_task" {
@@ -510,6 +697,16 @@ output "ecs_cluster_name" {
   description = "ECS cluster name"
   value       = aws_ecs_cluster.main.name
 }
+
+output "database_secret_arn" {
+  description = "ARN of the database secret in AWS Secrets Manager"
+  value       = aws_secretsmanager_secret.db_password.arn
+}
+
+output "database_password_command" {
+  description = "Command to retrieve database password"
+  value       = "aws secretsmanager get-secret-value --secret-id ${aws_secretsmanager_secret.db_password.name} --query SecretString --output text | jq -r '.password'"
+}
 ```
 
 ## Step 4: Deployment Script
@@ -520,13 +717,15 @@ output "ecs_cluster_name" {
 
 set -e
 
-echo "🚀 Starting SonarQube AWS Deployment..."
+echo "🚀 Starting SonarQube AWS Deployment with ECR..."
 
-# Check if terraform is installed
-if ! command -v terraform &> /dev/null; then
-    echo "❌ Terraform is not installed. Please install it first."
-    exit 1
-fi
+# Check prerequisites
+for cmd in terraform docker aws jq; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "❌ $cmd is not installed. Please install it first."
+        exit 1
+    fi
+done
 
 # Check if AWS CLI is configured
 if ! aws sts get-caller-identity &> /dev/null; then
@@ -541,26 +740,25 @@ cd terraform
 echo "📦 Initializing Terraform..."
 terraform init
 
-# Generate a random password for database
-DB_PASSWORD=$(openssl rand -base64 32)
-echo "🔐 Generated database password"
-
 # Plan the deployment
 echo "📋 Planning deployment..."
-terraform plan -var="db_password=$DB_PASSWORD"
+terraform plan
 
 # Ask for confirmation
 read -p "Do you want to proceed with the deployment? (yes/no): " -r
 if [[ $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
     echo "🏗️  Deploying infrastructure..."
-    terraform apply -auto-approve -var="db_password=$DB_PASSWORD"
+    terraform apply -auto-approve
     
-    echo "✅ Deployment completed!"
+    echo "✅ Infrastructure deployed!"
     echo "🌐 SonarQube URL: $(terraform output -raw sonarqube_url)"
-    echo "📝 Save this database password: $DB_PASSWORD"
+    echo ""
+    echo "🔐 Database credentials are stored securely in AWS Secrets Manager"
+    echo "📋 To retrieve database password:"
+    echo "   $(terraform output -raw database_password_command)"
     echo ""
     echo "⏳ Please wait 5-10 minutes for SonarQube to fully start up."
-    echo "🔑 Default login: admin/admin (you'll be prompted to change this)"
+    echo "🔑 Default SonarQube login: admin/admin"
 else
     echo "❌ Deployment cancelled"
 fi
